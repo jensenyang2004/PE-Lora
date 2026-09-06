@@ -1,0 +1,6 @@
+[submodule "ImgEdit"]
+	path = ImgEdit
+	url = https://github.com/PKU-YuanGroup/ImgEdit.git
+[submodule "diffusers"]
+	path = diffusers
+	url = https://github.com/huggingface/diffusers.git
