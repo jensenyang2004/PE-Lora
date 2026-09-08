@@ -64,15 +64,13 @@ import io
 import json
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
-from huggingface_hub import HfApi, get_token, hf_hub_url
-from PIL import Image
+from huggingface_hub import HfApi, get_token
 
-REPO_ID = "sysuyy/ImgEdit"
-REPO_TYPE = "dataset"
+from _hf_tar_stream import MultiUrlReader, iter_grouped_samples, list_split_urls
 
 EXPECTED_FILES = {"original.png", "result.png", "mask.png", "result.json", "judge.json"}
 
@@ -103,95 +101,6 @@ class Counters:
     rejected_mask_frac: int = 0
     rejected_missing_obj: int = 0
     rejected_parse: int = 0
-
-
-class MultiUrlReader:
-    """Sequential (non-seekable) reader across an ordered list of URLs.
-
-    A tar's `.tar.split.NNN` files are just a raw byte-split of one big tar,
-    so reading them back-to-back in order reproduces the original tar stream.
-    Only `.read(size)` is implemented since tarfile's streaming mode
-    (`mode="r|"`) never seeks.
-    """
-
-    def __init__(self, urls: list[str], session: requests.Session):
-        self._urls = list(urls)
-        self._session = session
-        self._idx = -1
-        self._resp: requests.Response | None = None
-        self._advance()
-
-    def _advance(self) -> None:
-        if self._resp is not None:
-            self._resp.close()
-        self._idx += 1
-        if self._idx >= len(self._urls):
-            self._resp = None
-            return
-        url = self._urls[self._idx]
-        print(f"    -> streaming {url.rsplit('/', 1)[-1]}", file=sys.stderr)
-        self._resp = self._session.get(url, stream=True, timeout=60)
-        self._resp.raise_for_status()
-        self._resp.raw.decode_content = True
-
-    def read(self, size: int = -1) -> bytes:
-        if self._resp is None:
-            return b""
-        chunks: list[bytes] = []
-        remaining = size if size and size > 0 else None
-        while True:
-            want = remaining if remaining is not None else 1 << 20
-            chunk = self._resp.raw.read(want)
-            if chunk:
-                chunks.append(chunk)
-                if remaining is not None:
-                    remaining -= len(chunk)
-                    if remaining <= 0:
-                        return b"".join(chunks)
-                else:
-                    return b"".join(chunks)
-            else:
-                self._advance()
-                if self._resp is None:
-                    return b"".join(chunks)
-
-    def close(self) -> None:
-        if self._resp is not None:
-            self._resp.close()
-
-
-def list_split_urls(api: HfApi, tar_base: str) -> list[str]:
-    files = api.list_repo_files(REPO_ID, repo_type=REPO_TYPE)
-    splits = sorted(f for f in files if f.startswith(f"Singleturn/{tar_base}.tar.split."))
-    if not splits:
-        raise FileNotFoundError(f"No split files found for {tar_base!r} under Singleturn/")
-    return [hf_hub_url(REPO_ID, f, repo_type=REPO_TYPE) for f in splits]
-
-
-def iter_grouped_samples(tf):
-    """Yield (sample_dir, {filename: bytes}) once every expected file for that
-    sample directory has been seen. Grouping is keyed by directory name (not
-    stream order) so it's correct even if entries aren't perfectly contiguous.
-    """
-    pending: dict[str, dict[str, bytes]] = {}
-    for member in tf:
-        if not member.isfile():
-            continue
-        parts = member.name.split("/")
-        if len(parts) < 3:
-            continue
-        sample_dir = "/".join(parts[:2])
-        fname = parts[-1]
-        if fname not in EXPECTED_FILES:
-            continue
-        f = tf.extractfile(member)
-        if f is None:
-            continue
-        bucket = pending.setdefault(sample_dir, {})
-        bucket[fname] = f.read()
-        if EXPECTED_FILES.issubset(bucket.keys()):
-            del pending[sample_dir]
-            yield sample_dir, bucket
 
 
 def parse_judge_score(judge_bytes: bytes) -> float | None:
@@ -320,7 +229,7 @@ def fetch_task(
         reader = MultiUrlReader(urls, session)
         try:
             with tarfile.open(fileobj=reader, mode="r|") as tf:
-                for sample_dir, files in iter_grouped_samples(tf):
+                for sample_dir, files in iter_grouped_samples(tf, EXPECTED_FILES):
                     row = process_sample(
                         task, sample_dir, files, tar_base, filters, counters, out_images_dir
                     )
