@@ -46,14 +46,54 @@ it's not just a pure appearance-only edit either). Use --exclude-types /
     exclude=add,        require-any=remove   -> ~33.3% of 28390 ~=  9,450  (default)
     exclude=add,remove                       -> ~13.2% of 28390 ~=  3,750
 
-IMPORTANT — data volume: matches are scattered essentially uniformly through
-the stream, so collecting most of a ~33%-hit-rate bucket means reading nearly
-all of the source data. The three hybrid tars total ~277GB combined
-(results_hybrid_part0 ~96GB, part2 ~90GB, part6 ~91GB, confirmed via the HF
-API's file listing). There is no way to skip non-matching samples in a
-sequential, unindexed tar stream — expect this to take a long time and pull
-a large amount of network traffic regardless of --max-total. Run it on the
-training server, not here.
+Data volume: the three hybrid tars total ~277GB combined (results_hybrid_part0
+~96GB, part2 ~90GB, part6 ~91GB, confirmed via the HF API's file listing).
+There's no separate metadata-only file with enough fields to filter ahead of
+time — the released `Parquet/hybrid_part{0,2,6}.parquet` only has
+{input_images, output_images, prompt}, no edit_type/bbox, so the real filter
+still has to come from each sample's result.json inside the tar.
+
+What DOES avoid reading everything: verified 2026-09-08 that HF's split
+files (`Singleturn/*.tar.split.NNN`) support HTTP Range requests (302
+redirect -> 206 Partial Content from the actual CDN URL). So instead of
+streaming the tar sequentially (`MultiUrlReader` + tarfile mode "r|", which
+must download every byte of every member, accepted or not), this script uses
+`SeekableMultiUrlReader` + tarfile mode "r": tarfile walks every member's
+header and skips its data via seek() at zero network cost, we read
+result.json in full (tiny) for every sample, and only Range-fetch the actual
+origin/result/mask images for samples that already pass the edit_type filter
+from that JSON alone (edit_type rejects 54-87% of samples depending on the
+bucket — see percentages above). Correctness verified live end-to-end
+(2026-09-08, part0): manifest rows and image/mask bytes are byte-identical
+in shape/content to what the old sequential path produced.
+
+CAVEAT — the wall-clock win depends on network latency to HF's CDN, which
+this assistant could only benchmark from its own sandbox, NOT the training
+server this is meant to run on:
+  - From that sandbox: each Range request carried ~0.7-1s of fairly fixed
+    latency almost independent of size, and sustained single-connection
+    throughput capped around ~5-9MB/s regardless of concurrency (tested up
+    to 12 parallel connections -- no aggregate improvement, meaning that
+    ceiling is this network's, not per-connection).
+  - Under those conditions, a SMALL Range-read-ahead buffer (chunk_size)
+    saves the most bytes but pays for it in request count -- e.g. at 32KB
+    chunks, 19 samples (3 accepted) cost 92 requests / 17MB and took ~35s
+    just walking headers; scaled to a full ~10k-sample part that's tens of
+    thousands of ~1s-latency requests, which can end up SLOWER in wall time
+    than just streaming the ~90GB straight through on one connection.
+  - A LARGER chunk_size (e.g. 2-4MB, the default) trades some of that byte
+    savings back for fewer requests, which was the better tradeoff in that
+    same sandbox test (45 requests / 153MB for the same 19 samples).
+  - On a well-connected training server (low latency, high bandwidth to
+    HF's CDN, as most cloud/datacenter boxes are), the latency term shrinks
+    and the byte savings should dominate outright, likely making even a
+    small chunk_size a clear win. This is untested from here.
+
+Before committing to a full run, sanity-check on the training server itself:
+  python scripts/fetch_imgedit_multi_instance.py --parts part0 --max-total 5
+and compare wall-clock time across a couple of --chunk-size-mb values (0.25,
+2, 8) to find what actually works best on that machine's connection to HF's
+CDN, rather than trusting the sandbox numbers above.
 
 Output layout (under --out-dir), one subdir per source part so parallel runs
 (one process per --parts value) never collide:
@@ -109,9 +149,20 @@ import requests
 from huggingface_hub import HfApi, get_token
 from PIL import Image
 
-from _hf_tar_stream import MultiUrlReader, iter_grouped_samples, list_split_urls
+from _hf_tar_stream import (
+    SeekableMultiUrlReader,
+    fetch_large_files,
+    iter_grouped_samples_lazy,
+    list_split_urls_with_sizes,
+)
 
-EXPECTED_FILES = {"origin_0.png", "result_1.png", "mask_0.png", "mask_1.png", "result.json"}
+# result.json is read in full for every sample regardless of outcome (it's
+# tiny, and tarfile has to touch its bytes anyway to reach the next header).
+# The actual images/masks are only Range-fetched once `quick_edit_type_ok`
+# has already accepted the sample from result.json alone -- see
+# `SeekableMultiUrlReader` in _hf_tar_stream.py.
+SMALL_FILES = {"result.json"}
+LARGE_FILES = {"origin_0.png", "result_1.png", "mask_0.png", "mask_1.png"}
 
 PARTS = {
     "part0": "results_hybrid_part0",
@@ -159,6 +210,22 @@ def bbox_and_centroid_norm(bbox: list[float], res_w: float, res_h: float) -> tup
     return bbox_norm, centroid_norm
 
 
+def quick_edit_type_ok(raw_json: bytes, filters: Filters) -> tuple[bool, str]:
+    """Cheap accept/reject decision from result.json alone, before paying
+    for the (large) image/mask bytes. Returns (passed, reason), reason in
+    {"parse", "edit_type", "ok"}."""
+    try:
+        meta = json.loads(raw_json)
+    except Exception:
+        return False, "parse"
+    edit_type = meta.get("edit_type")
+    if not (isinstance(edit_type, list) and len(edit_type) == 2):
+        return False, "parse"
+    if not filters.edit_type_passes(edit_type):
+        return False, "edit_type"
+    return True, "ok"
+
+
 def process_sample(
     sample_dir: str,
     files: dict[str, bytes],
@@ -167,8 +234,6 @@ def process_sample(
     counters: Counters,
     out_images_dir: Path,
 ) -> dict | None:
-    counters.seen += 1
-
     try:
         meta = json.loads(files["result.json"])
     except Exception:
@@ -259,18 +324,34 @@ def fetch_part(
     api: HfApi,
     max_total: int | None,
     global_accepted: list[int],
+    chunk_size: int,
 ) -> None:
     counters = Counters()
     out_images_dir = out_dir / "images"
     tar_base = PARTS[part]
 
-    urls = list_split_urls(api, tar_base)
-    print(f"[{part}] streaming {tar_base} ({len(urls)} split file(s), no cap — see module docstring)")
-    reader = MultiUrlReader(urls, session)
+    urls_sizes = list_split_urls_with_sizes(api, tar_base, session)
+    total_gb = sum(size for _, size in urls_sizes) / (1 << 30)
+    print(
+        f"[{part}] indexing {tar_base} ({len(urls_sizes)} split file(s), {total_gb:.1f} GB total) — "
+        f"only edit_type-accepted samples' images/masks get Range-fetched"
+    )
+    reader = SeekableMultiUrlReader(urls_sizes, session, chunk_size=chunk_size)
     try:
-        with tarfile.open(fileobj=reader, mode="r|") as tf:
-            for sample_dir, files in iter_grouped_samples(tf, EXPECTED_FILES):
-                row = process_sample(sample_dir, files, tar_base, filters, counters, out_images_dir)
+        with tarfile.open(fileobj=reader, mode="r") as tf:
+            for sample_dir, small_bytes, large_offsets in iter_grouped_samples_lazy(tf, SMALL_FILES, LARGE_FILES):
+                counters.seen += 1
+                ok, reason = quick_edit_type_ok(small_bytes["result.json"], filters)
+                row = None
+                if not ok:
+                    if reason == "parse":
+                        counters.rejected_parse += 1
+                    else:
+                        counters.rejected_edit_type += 1
+                else:
+                    files = fetch_large_files(reader, large_offsets)
+                    files["result.json"] = small_bytes["result.json"]
+                    row = process_sample(sample_dir, files, tar_base, filters, counters, out_images_dir)
                 if row is not None:
                     manifest_fh.write(json.dumps(row) + "\n")
                     manifest_fh.flush()
@@ -308,6 +389,18 @@ def main() -> None:
     parser.add_argument("--require-any-type", type=str, default="remove", help="comma-separated edit_type values; at least one must be present (empty string to disable)")
     parser.add_argument("--min-mask-frac", type=float, default=0.001)
     parser.add_argument("--max-mask-frac", type=float, default=0.7)
+    parser.add_argument(
+        "--chunk-size-mb",
+        type=float,
+        default=2.0,
+        help=(
+            "read-ahead buffer for the header-walk Range reader. Smaller = less "
+            "wasted bandwidth on rejected samples but more (latency-bound) HTTP "
+            "requests; larger = fewer requests but closer to a full download. "
+            "The right value depends on this machine's latency to HF's CDN -- "
+            "tune with a small --max-total run and compare wall-clock time."
+        ),
+    )
     parser.add_argument("--hf-token", type=str, default=None)
     args = parser.parse_args()
 
@@ -350,6 +443,7 @@ def main() -> None:
                 api=api,
                 max_total=max_total,
                 global_accepted=global_accepted,
+                chunk_size=int(args.chunk_size_mb * (1 << 20)),
             )
         print(f"[{part}] manifest written to {manifest_path}")
 
