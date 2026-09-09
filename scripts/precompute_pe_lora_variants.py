@@ -276,6 +276,10 @@ def main() -> None:
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        print(f"Using device: cuda ({torch.cuda.get_device_name(0)})")
+    else:
+        print("WARNING: no CUDA device found, running on CPU -- this will be extremely slow for a real run.")
 
     manifest_dir = args.manifest.parent
     rows = [json.loads(line) for line in args.manifest.open()]
@@ -314,6 +318,8 @@ def main() -> None:
     n_accepted = 0
     t0 = time.time()
 
+    bucket_list = generate_aspect_ratio_buckets(args.resolution, divisibility=args.bucket_divisibility)
+
     for row_idx, row in enumerate(rows):
         sample_id = row["id"]
         sample_dir = args.out_dir / sample_id
@@ -340,7 +346,6 @@ def main() -> None:
             for m in mask_images
         ]
 
-        bucket_list = generate_aspect_ratio_buckets(args.resolution, divisibility=args.bucket_divisibility)
         bucket = bucket_list[find_nearest_bucket(target_h, target_w, bucket_list)]
 
         # --- text variants (<=2, shared across all K geometric variants) ---
@@ -375,6 +380,7 @@ def main() -> None:
             total_bytes += path.stat().st_size
 
         # --- geometric variants ---
+        print(f"[{row_idx + 1}/{len(rows)}] {sample_id}: text encoded, building {args.num_variants} geometric variants...", file=sys.stderr)
         bboxes_norm = [inst["bbox_norm"] for inst in instances]
         geo_idx = 0
         for _ in range(args.num_variants):
@@ -443,16 +449,17 @@ def main() -> None:
         index_fh.flush()
         n_accepted += 1
 
-        if (row_idx + 1) % 20 == 0 or row_idx == len(rows) - 1:
-            elapsed = time.time() - t0
-            print(
-                f"[{row_idx + 1}/{len(rows)}] accepted={n_accepted} "
-                f"dropout_matched={n_dropout_matched} template_fallback={n_template_fallback} "
-                f"truncated={n_truncated} fallback_crops={n_fallback_crops} "
-                f"skipped_variants={n_skipped_variants} disk={total_bytes / 1e9:.2f}GB "
-                f"elapsed={elapsed:.0f}s",
-                file=sys.stderr,
-            )
+        elapsed = time.time() - t0
+        s_per_row = elapsed / (row_idx + 1)
+        eta = s_per_row * (len(rows) - row_idx - 1)
+        print(
+            f"[{row_idx + 1}/{len(rows)}] accepted={n_accepted} "
+            f"dropout_matched={n_dropout_matched} template_fallback={n_template_fallback} "
+            f"truncated={n_truncated} fallback_crops={n_fallback_crops} "
+            f"skipped_variants={n_skipped_variants} disk={total_bytes / 1e9:.2f}GB "
+            f"elapsed={elapsed:.0f}s ({s_per_row:.1f}s/sample, ETA {eta / 60:.0f}min)",
+            file=sys.stderr,
+        )
 
     index_fh.close()
     (args.out_dir / "meta.json").write_text(
