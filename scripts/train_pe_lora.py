@@ -5,10 +5,22 @@ PE-injection LoRA training loop for Flux2 Klein ([[project_pe_lora_goal]]).
 Loads ONLY the Flux2 transformer (bf16) + LoRA adapters + the (tiny)
 flow-matching noise scheduler -- no VAE, no Qwen3 text encoder, no full
 Flux2KleinPipeline resident. All per-sample data (VAE latents, Qwen3 prompt
-embeddings, and the RoPE ids with the target-instance centroid already baked
-into the text tokens' H,W) comes from a cache built by
+embeddings, and the RoPE ids with each instance's centroid already baked
+into its own text tokens' H,W) comes from a cache built by
 scripts/precompute_pe_lora_variants.py -- see that script's docstring and
 the project plan for why encoding is done offline rather than online.
+
+Training is on 2-instance samples (one combined prompt covering two edits,
+see [[project_pe_lora_goal]]), so besides the two different injected
+centroids, every step also builds a cross-instance attention mask (blocking
+instance 0's text tokens from attending to instance 1's and vice versa --
+RoPE generalizes poorly to relative text-to-text distances never seen in
+training, and training only ever has 2 instances' worth of that distance
+while inference needs up to ~8) via
+pe_lora_common.build_cross_instance_attention_mask, from the cached
+`instance_ids` -- NOT baked into the cache itself (a full [L+S, L+S] mask
+would be tens of MB per variant at real image-token counts; instance_ids is
+a few hundred bytes).
 
 Physical batch_size is hard-pinned to 1 (not just defaulted): Flux2Transformer2DModel.forward
 squeezes img_ids/txt_ids to batch index 0 whenever they arrive with a batch
@@ -74,6 +86,8 @@ from diffusers.training_utils import (
     free_memory,
 )
 
+from pe_lora_common import build_cross_instance_attention_mask
+
 logger = get_logger(__name__)
 
 
@@ -105,6 +119,7 @@ class PELoraVariantBankDataset(Dataset):
             "text_ids": geo["text_ids"],
             "img_ids": geo["img_ids"],
             "prompt_embeds": text["prompt_embeds"],
+            "instance_ids": text["instance_ids"],
         }
 
 
@@ -122,6 +137,7 @@ def collate_fn(examples: list[dict]) -> dict:
         "text_ids": ex["text_ids"],
         "img_ids": ex["img_ids"],
         "prompt_embeds": ex["prompt_embeds"].unsqueeze(0),
+        "instance_ids": ex["instance_ids"],
     }
 
 
@@ -362,6 +378,7 @@ def main() -> None:
                 text_ids = batch["text_ids"].to(device=accelerator.device)
                 img_ids = batch["img_ids"].to(device=accelerator.device)
                 prompt_embeds = batch["prompt_embeds"].to(dtype=weight_dtype)
+                instance_ids = batch["instance_ids"]
 
                 noise = torch.randn_like(model_input)
                 bsz = model_input.shape[0]
@@ -382,6 +399,10 @@ def main() -> None:
                 orig_main_len = packed_noisy_model_input.shape[1]
 
                 packed_input = torch.cat([packed_noisy_model_input, packed_cond_model_input], dim=1)
+                num_img_tokens = packed_input.shape[1]
+                attention_mask = build_cross_instance_attention_mask(instance_ids, num_img_tokens).to(
+                    accelerator.device
+                )
 
                 if unwrap_model(transformer).config.guidance_embeds:
                     guidance = torch.full([1], args.guidance_scale, device=accelerator.device).expand(bsz)
@@ -395,6 +416,7 @@ def main() -> None:
                     encoder_hidden_states=prompt_embeds,
                     txt_ids=text_ids,
                     img_ids=img_ids,
+                    joint_attention_kwargs={"attention_mask": attention_mask},
                     return_dict=False,
                 )[0]
 
