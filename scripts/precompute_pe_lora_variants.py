@@ -382,12 +382,22 @@ def main() -> None:
             total_bytes += path.stat().st_size
 
         # --- geometric variants ---
-        print(f"[{row_idx + 1}/{len(rows)}] {sample_id}: text encoded, building {args.num_variants} geometric variants...", file=sys.stderr)
+        print(
+            f"[{row_idx + 1}/{len(rows)}] {sample_id}: text encoded, building {args.num_variants} geometric "
+            f"variants... (source image {output_image.size}, target bucket {bucket})",
+            file=sys.stderr,
+        )
         bboxes_norm = [inst["bbox_norm"] for inst in instances]
         geo_idx = 0
-        for _ in range(args.num_variants):
+        for variant_i in range(args.num_variants):
+            t_variant0 = time.time()
             result = augment_variant_multi(
                 output_image, input_image, mask_images, bucket, bboxes_norm, rng, args.min_mask_frac, args.crop_retries
+            )
+            print(
+                f"[{row_idx + 1}/{len(rows)}] {sample_id}: variant {variant_i} augment "
+                f"took {time.time() - t_variant0:.2f}s ({'skipped' if result is None else 'ok'})",
+                file=sys.stderr,
             )
             if result is None:
                 n_skipped_variants += 1
@@ -402,6 +412,7 @@ def main() -> None:
                 text_idx = 1
             text_ids = inject_centroids(text_variants[text_idx]["instance_ids"], centroids_grid)
 
+            t_encode0 = time.time()
             with torch.no_grad():
                 out_t = to_normalized_tensor(out_c).unsqueeze(0).to(device=device, dtype=dtype)
                 in_t = to_normalized_tensor(in_c).unsqueeze(0).to(device=device, dtype=dtype)
@@ -416,6 +427,11 @@ def main() -> None:
                 main_ids = Flux2KleinPipeline._prepare_latent_ids(model_input)
                 cond_ids = Flux2KleinPipeline._prepare_image_ids([cond_model_input], scale=IMAGE_TEMPORAL_SCALE)
                 img_ids = torch.cat([main_ids, cond_ids], dim=1)[0]  # [S_main+S_cond, 4]
+            print(
+                f"[{row_idx + 1}/{len(rows)}] {sample_id}: variant {variant_i} vae-encode took "
+                f"{time.time() - t_encode0:.2f}s",
+                file=sys.stderr,
+            )
 
             record = {
                 "model_input": model_input[0].to(torch.bfloat16).cpu(),
