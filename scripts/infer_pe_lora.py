@@ -11,9 +11,13 @@ and reimplements __call__'s denoising loop by hand, substituting:
   - txt_ids: built via pe_lora_common.inject_centroids, the exact same
     function scripts/precompute_pe_lora_variants.py uses, from a per-token
     instance_ids vector (pe_lora_common.compute_instance_ids) and each
-    instance's desired centroid (caller-supplied here, since at inference
-    the desired object *placement* is the whole point -- there's no ground
-    truth mask to derive it from like there is at train time).
+    instance's centroid -- derived here from a caller-supplied mask via
+    pe_lora_common.mask_centroid_px, the same function and mask convention
+    (dark=object) precompute_pe_lora_variants.py uses, rather than a
+    hand-picked point: at inference you know where you want the edited
+    object's *region* to be (e.g. a rough mask drawn over the source
+    image), and the centroid is derived from that exactly as it would be
+    from a ground-truth mask at train time.
   - attention_kwargs={"attention_mask": ...}: the same cross-instance mask
     scripts/train_pe_lora.py builds via
     pe_lora_common.build_cross_instance_attention_mask, so text tokens
@@ -37,23 +41,29 @@ Example (2 instances):
       --pretrained_model_name_or_path black-forest-labs/FLUX.2-klein \
       --lora-dir ./out/pe_lora_run \
       --source-image ./examples/source.png \
-      --segment "add a red exit sign above the door" --center 0.72 0.18 \
-      --segment "darken the window on the left" --center 0.15 0.55 \
+      --segment "add a red exit sign above the door" --mask ./examples/mask_sign.png \
+      --segment "darken the window on the left" --mask ./examples/mask_window.png \
       --output ./out/edited.png
 
 Example (4 instances, testing generalization beyond the 2-instance training data):
   python scripts/infer_pe_lora.py \
       --pretrained_model_name_or_path black-forest-labs/FLUX.2-klein \
       --lora-dir ./out/pe_lora_run --source-image ./examples/source.png \
-      --segment "add a red exit sign above the door" --center 0.72 0.18 \
-      --segment "darken the window on the left" --center 0.15 0.55 \
-      --segment "remove the trash can" --center 0.50 0.85 \
-      --segment "replace the poster with a map" --center 0.30 0.40 \
+      --segment "add a red exit sign above the door" --mask ./examples/mask_sign.png \
+      --segment "darken the window on the left" --mask ./examples/mask_window.png \
+      --segment "remove the trash can" --mask ./examples/mask_trash.png \
+      --segment "replace the poster with a map" --mask ./examples/mask_poster.png \
       --output ./out/edited.png
 
---center is (cx, cy) normalized to [0, 1] of the OUTPUT image (--height/--width)
--- i.e. where you want that instance's edit to be anchored, not where it
-currently is in the source image.
+--mask is a per-instance mask image (one per --segment, same order): dark
+(<128) pixels mark the object region, matching ImgEdit's mask convention
+(see [[project_imgedit_dataset_gotchas]] and pe_lora_common.mask_centroid_px's
+docstring) -- the same convention precompute_pe_lora_variants.py assumes for
+its ground-truth masks. It's resized (nearest-neighbor) to --height/--width
+if it doesn't already match, then its centroid (mean pixel position of the
+dark region) is what actually gets injected -- so the mask only needs to
+mark roughly *where* you want that instance anchored in the OUTPUT image,
+not be pixel-perfect.
 """
 
 from __future__ import annotations
@@ -64,11 +74,18 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from PIL.ImageOps import exif_transpose
 
 from diffusers import Flux2KleinPipeline
 from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu, retrieve_timesteps
 
-from pe_lora_common import build_cross_instance_attention_mask, compute_instance_ids, inject_centroids, px_to_patched_grid
+from pe_lora_common import (
+    build_cross_instance_attention_mask,
+    compute_instance_ids,
+    inject_centroids,
+    mask_centroid_px,
+    px_to_patched_grid,
+)
 from precompute_pe_lora_variants import DOWNSAMPLE, encode_prompt_with_offsets
 
 AND_GLUE = " and "
@@ -96,8 +113,8 @@ def main() -> None:
     parser.add_argument("--source-image", type=Path, required=True)
     parser.add_argument("--segment", action="append", required=True, help="one instance's edit clause; repeat per instance")
     parser.add_argument(
-        "--center", action="append", nargs=2, type=float, required=True,
-        help="(cx, cy) normalized to [0,1] of the OUTPUT image for this instance; repeat once per --segment, same order",
+        "--mask", action="append", type=Path, required=True,
+        help="per-instance mask image (dark=object, ImgEdit convention); repeat once per --segment, same order",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--height", type=int, default=1024)
@@ -109,8 +126,8 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     args = parser.parse_args()
 
-    if len(args.segment) != len(args.center):
-        raise ValueError(f"got {len(args.segment)} --segment but {len(args.center)} --center, must match 1:1 in order")
+    if len(args.segment) != len(args.mask):
+        raise ValueError(f"got {len(args.segment)} --segment but {len(args.mask)} --mask, must match 1:1 in order")
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,7 +143,18 @@ def main() -> None:
     print(f"Loading LoRA weights from {args.lora_dir}...")
     pipe.load_lora_weights(str(args.lora_dir))
 
-    # --- text: encode + compute per-token instance_ids + inject centroids ---
+    # --- image conditioning (source image to edit) ---
+    multiple_of = pipe.vae_scale_factor * 2
+    height = (args.height // multiple_of) * multiple_of
+    width = (args.width // multiple_of) * multiple_of
+
+    source_image = Image.open(args.source_image).convert("RGB")
+    cond_image = pipe.image_processor.preprocess(source_image, height=height, width=width, resize_mode="crop")
+    image_latents, image_latent_ids = pipe.prepare_image_latents(
+        images=[cond_image], batch_size=1, generator=generator, device=device, dtype=pipe.vae.dtype
+    )
+
+    # --- text: encode + compute per-token instance_ids ---
     text, spans = build_prompt_and_spans(args.segment)
     print(f"Prompt: {text!r}")
     embeds, _amask, offsets, was_truncated = encode_prompt_with_offsets(
@@ -137,21 +165,17 @@ def main() -> None:
     prompt_embeds = embeds.unsqueeze(0).to(device=device, dtype=dtype)  # [1, L, D]
     instance_ids = compute_instance_ids(offsets, spans)  # [L]
 
-    centroids_grid = [
-        px_to_patched_grid(cx_norm * args.width, cy_norm * args.height, downsample=DOWNSAMPLE)
-        for cx_norm, cy_norm in args.center
-    ]
+    # --- masks -> centroids (mean pixel position of the dark region, resized to output dims first) ---
+    centroids_grid = []
+    for mask_path in args.mask:
+        mask = exif_transpose(Image.open(mask_path)).convert("L")
+        if mask.size != (width, height):
+            mask = mask.resize((width, height), Image.NEAREST)
+        centroid_px = mask_centroid_px(np.array(mask))
+        if centroid_px is None:
+            raise ValueError(f"{mask_path}: mask has no dark (<128) pixels, can't derive a centroid")
+        centroids_grid.append(px_to_patched_grid(*centroid_px, downsample=DOWNSAMPLE))
     text_ids = inject_centroids(instance_ids, centroids_grid).unsqueeze(0).to(device)  # [1, L, 4]
-
-    # --- image conditioning (source image to edit) ---
-    source_image = Image.open(args.source_image).convert("RGB")
-    multiple_of = pipe.vae_scale_factor * 2
-    height = (args.height // multiple_of) * multiple_of
-    width = (args.width // multiple_of) * multiple_of
-    cond_image = pipe.image_processor.preprocess(source_image, height=height, width=width, resize_mode="crop")
-    image_latents, image_latent_ids = pipe.prepare_image_latents(
-        images=[cond_image], batch_size=1, generator=generator, device=device, dtype=pipe.vae.dtype
-    )
 
     num_channels_latents = pipe.transformer.config.in_channels // 4
     latents, latent_ids = pipe.prepare_latents(
