@@ -384,6 +384,7 @@ def main() -> None:
             global_step = int(os.path.basename(str(path)).split("-")[1])
 
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    train_loss = 0.0
 
     for epoch in range(args.num_train_epochs):
         transformer.train()
@@ -447,6 +448,14 @@ def main() -> None:
                 )
                 loss = loss.mean()
 
+                # Gather across DDP replicas (multi-GPU: each replica computed its own
+                # single-example loss) and accumulate the per-micro-step average so what
+                # gets logged is one number per OPTIMIZER step, not one high-variance
+                # single-example loss per micro-step -- same idiom as this repo's own
+                # diffusers examples (e.g. examples/instruct_pix2pix/train_instruct_pix2pix.py).
+                avg_loss = accelerator.gather(loss.repeat(1)).mean()
+                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(lora_params, args.max_grad_norm)
@@ -461,6 +470,11 @@ def main() -> None:
                 progress_bar.update(1)
                 global_step += 1
 
+                logs = {"train_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+                train_loss = 0.0
+
                 if accelerator.is_main_process and global_step % args.checkpointing_steps == 0:
                     if args.checkpoints_total_limit is not None:
                         checkpoints = sorted(
@@ -473,10 +487,6 @@ def main() -> None:
                     save_path = args.output_dir / f"checkpoint-{global_step}"
                     accelerator.save_state(str(save_path))
                     logger.info(f"Saved state to {save_path}")
-
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
