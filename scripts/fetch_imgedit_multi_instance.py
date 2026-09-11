@@ -106,6 +106,15 @@ Output layout (under --out-dir), one subdir per source part so parallel runs
 Merge the per-part manifests afterward with e.g.
   cat manifest_part*.jsonl > manifest.jsonl
 
+Resumable: re-running the same command against the same --out-dir after a
+connection drop (or anything else that kills the process mid-run) skips
+every sample_id already present in that part's manifest_<part>.jsonl --
+those samples' images/masks are already fully on disk (a manifest row is
+only ever written after process_sample finishes writing them), so nothing
+is re-downloaded or re-appended. --max-total still counts previously
+-accepted samples toward the target, so a second run only fetches what's
+left.
+
 Manifest row:
   {
     "id": str, "edit_prompt": str, "edit_type": [str, str],
@@ -191,10 +200,36 @@ class Filters:
 class Counters:
     seen: int = 0
     accepted: int = 0
+    skipped_existing: int = 0
     rejected_edit_type: int = 0
     rejected_mask_frac: int = 0
     rejected_missing_obj: int = 0
     rejected_parse: int = 0
+
+
+def sample_id_from_dir(sample_dir: str) -> str:
+    return sample_dir.split("/", 1)[1]
+
+
+def load_existing_ids(manifest_path: Path) -> set[str]:
+    """Sample ids already accepted by a previous (possibly connection-killed)
+    run's manifest, so a re-run can skip them instead of re-fetching. Each
+    manifest row is only ever written after that sample's images are fully
+    on disk (fetch_part appends+flushes right after process_sample returns
+    non-None), so a row present here means that sample is complete, not
+    partially written -- no separate on-disk file check needed."""
+    if not manifest_path.exists():
+        return set()
+    ids = set()
+    for line in manifest_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ids.add(json.loads(line)["id"])
+        except Exception:
+            pass  # a truncated last line from a killed run -- ignore, not resumable anyway
+    return ids
 
 
 def mask_area_frac(mask_img: Image.Image) -> float:
@@ -276,7 +311,7 @@ def process_sample(
         counters.rejected_mask_frac += 1
         return None
 
-    sample_id = f"{sample_dir.split('/', 1)[1]}"
+    sample_id = sample_id_from_dir(sample_dir)
     sample_out_dir = out_images_dir / sample_id
     sample_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -325,6 +360,7 @@ def fetch_part(
     max_total: int | None,
     global_accepted: list[int],
     chunk_size: int,
+    existing_ids: set[str],
 ) -> None:
     counters = Counters()
     out_images_dir = out_dir / "images"
@@ -335,23 +371,30 @@ def fetch_part(
     print(
         f"[{part}] indexing {tar_base} ({len(urls_sizes)} split file(s), {total_gb:.1f} GB total) — "
         f"only edit_type-accepted samples' images/masks get Range-fetched"
+        + (f", skipping {len(existing_ids)} already-fetched sample(s)" if existing_ids else "")
     )
     reader = SeekableMultiUrlReader(urls_sizes, session, chunk_size=chunk_size)
     try:
         with tarfile.open(fileobj=reader, mode="r") as tf:
             for sample_dir, small_bytes, large_offsets in iter_grouped_samples_lazy(tf, SMALL_FILES, LARGE_FILES):
                 counters.seen += 1
-                ok, reason = quick_edit_type_ok(small_bytes["result.json"], filters)
                 row = None
-                if not ok:
-                    if reason == "parse":
-                        counters.rejected_parse += 1
-                    else:
-                        counters.rejected_edit_type += 1
+                # Cheap id check before paying for even the quick_edit_type_ok/
+                # large-file Range-fetch path -- a previous run already has
+                # this sample's images and manifest row on disk.
+                if sample_id_from_dir(sample_dir) in existing_ids:
+                    counters.skipped_existing += 1
                 else:
-                    files = fetch_large_files(reader, large_offsets)
-                    files["result.json"] = small_bytes["result.json"]
-                    row = process_sample(sample_dir, files, tar_base, filters, counters, out_images_dir)
+                    ok, reason = quick_edit_type_ok(small_bytes["result.json"], filters)
+                    if not ok:
+                        if reason == "parse":
+                            counters.rejected_parse += 1
+                        else:
+                            counters.rejected_edit_type += 1
+                    else:
+                        files = fetch_large_files(reader, large_offsets)
+                        files["result.json"] = small_bytes["result.json"]
+                        row = process_sample(sample_dir, files, tar_base, filters, counters, out_images_dir)
                 if row is not None:
                     manifest_fh.write(json.dumps(row) + "\n")
                     manifest_fh.flush()
@@ -359,7 +402,7 @@ def fetch_part(
                 if counters.seen % 100 == 0:
                     print(
                         f"[{part}] seen={counters.seen} accepted={counters.accepted} "
-                        f"(global={global_accepted[0]}) "
+                        f"skipped_existing={counters.skipped_existing} (global={global_accepted[0]}) "
                         f"(rej: edit_type={counters.rejected_edit_type} mask_frac={counters.rejected_mask_frac} "
                         f"missing_obj={counters.rejected_missing_obj} parse={counters.rejected_parse})",
                         file=sys.stderr,
@@ -433,6 +476,10 @@ def main() -> None:
         if max_total is not None and global_accepted[0] >= max_total:
             break
         manifest_path = args.out_dir / f"manifest_{part}.jsonl"
+        existing_ids = load_existing_ids(manifest_path)
+        if existing_ids:
+            print(f"[{part}] resuming: {len(existing_ids)} sample(s) already in {manifest_path}, will skip them")
+            global_accepted[0] += len(existing_ids)
         with open(manifest_path, "a") as manifest_fh:
             fetch_part(
                 part=part,
@@ -444,6 +491,7 @@ def main() -> None:
                 max_total=max_total,
                 global_accepted=global_accepted,
                 chunk_size=int(args.chunk_size_mb * (1 << 20)),
+                existing_ids=existing_ids,
             )
         print(f"[{part}] manifest written to {manifest_path}")
 

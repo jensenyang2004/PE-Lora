@@ -146,7 +146,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--num-inference-steps", type=int, default=28)
+    parser.add_argument("--num-inference-steps", type=int, default=4)
     parser.add_argument("--guidance-scale", type=float, default=4.0)
     parser.add_argument("--max-sequence-length", type=int, default=160, help="match the value precompute was run with")
     parser.add_argument("--seed", type=int, default=0)
