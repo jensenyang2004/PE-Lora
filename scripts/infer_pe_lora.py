@@ -36,39 +36,47 @@ is a distilled model (do_classifier_free_guidance is gated on
 (see __call__'s negative_prompt_embeds/negative_text_ids handling) if you
 point this at a non-distilled checkpoint with guidance_scale > 1.
 
-Example (2 instances):
+Reads one case from a benchmark metadata JSON (paths in the JSON are
+relative to the JSON file's own directory, the benchmark's data root):
+  {
+    "00": {
+      "image_path": "images/00.png",
+      "mask_path": "\"masks/00_0.png\" \"masks/00_1.png\" ...",
+      "source_prompt": "\"wine glass\" \"wine glass\" ...",
+      "fg_prompt": "\"a highball glass of iced tea\" ...",
+      "edit_inst_single": "...", "edit_inst_multi": "..."
+    }, ...
+  }
+`mask_path`/`source_prompt`/`fg_prompt` are shell-quoted, space-separated
+lists (one token per instance -- parsed with shlex.split) of equal length.
+Each instance's clause is synthesized as "change {source} into {fg}" --
+NOT taken from edit_inst_single/edit_inst_multi, deliberately: those
+describe *where* the object is in natural language ("the salad on the
+left"), which would let the model localize from text instead of from the
+injected centroid. Using the bare source/fg pair is a real test of whether
+RoPE injection alone carries the localization signal.
+
+Example:
   python scripts/infer_pe_lora.py \
       --pretrained_model_name_or_path black-forest-labs/FLUX.2-klein \
       --lora-dir ./out/pe_lora_run \
-      --source-image ./examples/source.png \
-      --segment "add a red exit sign above the door" --mask ./examples/mask_sign.png \
-      --segment "darken the window on the left" --mask ./examples/mask_window.png \
-      --output ./out/edited.png
+      --benchmark-json ./data/eval_benchmark/meta.json --case-id 00 \
+      --output ./out/00.png
 
-Example (4 instances, testing generalization beyond the 2-instance training data):
-  python scripts/infer_pe_lora.py \
-      --pretrained_model_name_or_path black-forest-labs/FLUX.2-klein \
-      --lora-dir ./out/pe_lora_run --source-image ./examples/source.png \
-      --segment "add a red exit sign above the door" --mask ./examples/mask_sign.png \
-      --segment "darken the window on the left" --mask ./examples/mask_window.png \
-      --segment "remove the trash can" --mask ./examples/mask_trash.png \
-      --segment "replace the poster with a map" --mask ./examples/mask_poster.png \
-      --output ./out/edited.png
-
---mask is a per-instance mask image (one per --segment, same order): dark
-(<128) pixels mark the object region, matching ImgEdit's mask convention
-(see [[project_imgedit_dataset_gotchas]] and pe_lora_common.mask_centroid_px's
-docstring) -- the same convention precompute_pe_lora_variants.py assumes for
-its ground-truth masks. It's resized (nearest-neighbor) to --height/--width
-if it doesn't already match, then its centroid (mean pixel position of the
-dark region) is what actually gets injected -- so the mask only needs to
-mark roughly *where* you want that instance anchored in the OUTPUT image,
-not be pixel-perfect.
+Masks: dark (<128) pixels mark the object region, matching ImgEdit's mask
+convention (see [[project_imgedit_dataset_gotchas]] and
+pe_lora_common.mask_centroid_px's docstring) -- the same convention
+precompute_pe_lora_variants.py assumes for its ground-truth masks. Each is
+resized (nearest-neighbor) to --height/--width if it doesn't already
+match, then its centroid (mean pixel position of the dark region) is what
+actually gets injected.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import shlex
 from pathlib import Path
 
 import numpy as np
@@ -91,6 +99,29 @@ from precompute_pe_lora_variants import DOWNSAMPLE, encode_prompt_with_offsets
 AND_GLUE = " and "
 
 
+def load_benchmark_case(benchmark_json: Path, case_id: str) -> tuple[Path, list[Path], list[str]]:
+    """Returns (source_image_path, [mask_path, ...], [segment_text, ...])
+    for one case, resolving image/mask paths against benchmark_json's own
+    directory (the benchmark's data root)."""
+    cases = json.loads(benchmark_json.read_text())
+    if case_id not in cases:
+        raise KeyError(f"case {case_id!r} not in {benchmark_json} (available: {sorted(cases)[:10]}...)")
+    case = cases[case_id]
+    data_root = benchmark_json.parent
+
+    mask_paths = [data_root / p for p in shlex.split(case["mask_path"])]
+    source_prompts = shlex.split(case["source_prompt"])
+    fg_prompts = shlex.split(case["fg_prompt"])
+    if not (len(mask_paths) == len(source_prompts) == len(fg_prompts)):
+        raise ValueError(
+            f"case {case_id!r}: mismatched instance counts -- "
+            f"{len(mask_paths)} masks, {len(source_prompts)} source_prompt, {len(fg_prompts)} fg_prompt"
+        )
+
+    segments = [f"change {src} into {fg}" for src, fg in zip(source_prompts, fg_prompts)]
+    return data_root / case["image_path"], mask_paths, segments
+
+
 def build_prompt_and_spans(segments: list[str]) -> tuple[str, list[tuple[int, int]]]:
     """Joins instance clauses the same way precompute_pe_lora_variants.py's
     resolve_instance_segments does ("{seg0}{AND_GLUE}{seg1}...") so spans
@@ -110,12 +141,8 @@ def main() -> None:
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--lora-dir", type=Path, required=True)
-    parser.add_argument("--source-image", type=Path, required=True)
-    parser.add_argument("--segment", action="append", required=True, help="one instance's edit clause; repeat per instance")
-    parser.add_argument(
-        "--mask", action="append", type=Path, required=True,
-        help="per-instance mask image (dark=object, ImgEdit convention); repeat once per --segment, same order",
-    )
+    parser.add_argument("--benchmark-json", type=Path, required=True, help="benchmark metadata JSON; paths inside are relative to its directory")
+    parser.add_argument("--case-id", type=str, required=True, help="key into the benchmark JSON, e.g. '00'")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--width", type=int, default=1024)
@@ -126,8 +153,8 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     args = parser.parse_args()
 
-    if len(args.segment) != len(args.mask):
-        raise ValueError(f"got {len(args.segment)} --segment but {len(args.mask)} --mask, must match 1:1 in order")
+    source_image_path, mask_paths, segments = load_benchmark_case(args.benchmark_json, args.case_id)
+    print(f"Case {args.case_id!r}: {len(segments)} instances")
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -148,14 +175,14 @@ def main() -> None:
     height = (args.height // multiple_of) * multiple_of
     width = (args.width // multiple_of) * multiple_of
 
-    source_image = Image.open(args.source_image).convert("RGB")
+    source_image = Image.open(source_image_path).convert("RGB")
     cond_image = pipe.image_processor.preprocess(source_image, height=height, width=width, resize_mode="crop")
     image_latents, image_latent_ids = pipe.prepare_image_latents(
         images=[cond_image], batch_size=1, generator=generator, device=device, dtype=pipe.vae.dtype
     )
 
     # --- text: encode + compute per-token instance_ids ---
-    text, spans = build_prompt_and_spans(args.segment)
+    text, spans = build_prompt_and_spans(segments)
     print(f"Prompt: {text!r}")
     embeds, _amask, offsets, was_truncated = encode_prompt_with_offsets(
         pipe.text_encoder, pipe.tokenizer, text, device, dtype, args.max_sequence_length
@@ -167,7 +194,7 @@ def main() -> None:
 
     # --- masks -> centroids (mean pixel position of the dark region, resized to output dims first) ---
     centroids_grid = []
-    for mask_path in args.mask:
+    for mask_path in mask_paths:
         mask = exif_transpose(Image.open(mask_path)).convert("L")
         if mask.size != (width, height):
             mask = mask.resize((width, height), Image.NEAREST)
