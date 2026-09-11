@@ -123,6 +123,21 @@ class PELoraVariantBankDataset(Dataset):
         }
 
 
+def seed_dataloader_worker(worker_id: int) -> None:
+    """DataLoader worker processes are forked from the parent and inherit
+    its exact `random` module state -- torch reseeds ITS OWN default RNG
+    per worker automatically, but stdlib `random` (what __getitem__'s
+    random.randrange actually uses to pick a geo variant) is untouched
+    unless reseeded here. Without this, --dataloader_num_workers > 1
+    workers can draw correlated (worst case identical) "random" variant
+    choices, silently cutting the augmentation diversity the variant-bank
+    re-roll is supposed to provide. torch.initial_seed() is already
+    base_seed + worker_id (set by torch's own per-worker seeding), so
+    reusing it here is enough to decorrelate workers without a separate
+    seed argument."""
+    random.seed(torch.initial_seed() % 2**32)
+
+
 def collate_fn(examples: list[dict]) -> dict:
     if len(examples) != 1:
         raise ValueError(
@@ -311,6 +326,7 @@ def main() -> None:
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
+        worker_init_fn=seed_dataloader_worker,
     )
 
     lora_params = list(filter(lambda p: p.requires_grad, transformer.parameters()))
