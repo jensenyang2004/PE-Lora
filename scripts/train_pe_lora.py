@@ -238,7 +238,16 @@ def main() -> None:
 
     logging_dir = args.output_dir / args.logging_dir
     accelerator_project_config = ProjectConfiguration(project_dir=str(args.output_dir), logging_dir=str(logging_dir))
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    # Every trainable LoRA param (Stage 1's double-stream Q/K, and Stage 2's
+    # single-stream to_qkv_mlp_proj if --enable-single-stream-lora is on) is
+    # exercised unconditionally on every forward pass -- there's no input-
+    # dependent control flow anywhere in this model that could skip one.
+    # zero_single_stream_non_qk_rows zeros WEIGHT VALUES post-step, not the
+    # computation graph, so those rows still count as "used" by autograd.
+    # find_unused_parameters=True buys nothing here and costs an extra full
+    # autograd-graph traversal every iteration -- confirmed by DDP's own
+    # runtime warning ("did not find any unused parameters") on a real run.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
