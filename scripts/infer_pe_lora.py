@@ -153,7 +153,7 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=None, help="output width; see --height")
     parser.add_argument("--resolution", type=int, default=1024, help="base resolution for aspect-ratio bucketing when --height/--width are omitted -- must match precompute's --resolution")
     parser.add_argument("--bucket-divisibility", type=int, default=16, help="must match precompute's --bucket-divisibility")
-    parser.add_argument("--num-inference-steps", type=int, default=28)
+    parser.add_argument("--num-inference-steps", type=int, default=4)
     parser.add_argument("--guidance-scale", type=float, default=4.0)
     parser.add_argument("--max-sequence-length", type=int, default=160, help="match the value precompute was run with")
     parser.add_argument("--seed", type=int, default=0)
