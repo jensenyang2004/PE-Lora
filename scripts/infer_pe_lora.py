@@ -86,6 +86,7 @@ from PIL.ImageOps import exif_transpose
 
 from diffusers import Flux2KleinPipeline
 from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu, retrieve_timesteps
+from diffusers.training_utils import find_nearest_bucket, generate_aspect_ratio_buckets
 
 from pe_lora_common import (
     build_cross_instance_attention_mask,
@@ -144,14 +145,22 @@ def main() -> None:
     parser.add_argument("--benchmark-json", type=Path, required=True, help="benchmark metadata JSON; paths inside are relative to its directory")
     parser.add_argument("--case-id", type=str, required=True, help="key into the benchmark JSON, e.g. '00'")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument(
+        "--height", type=int, default=None,
+        help="output height; if omitted (with --width), auto-picked from the source image's own aspect ratio via "
+        "the same bucket system precompute_pe_lora_variants.py trained on -- pass both to override",
+    )
+    parser.add_argument("--width", type=int, default=None, help="output width; see --height")
+    parser.add_argument("--resolution", type=int, default=1024, help="base resolution for aspect-ratio bucketing when --height/--width are omitted -- must match precompute's --resolution")
+    parser.add_argument("--bucket-divisibility", type=int, default=16, help="must match precompute's --bucket-divisibility")
     parser.add_argument("--num-inference-steps", type=int, default=28)
     parser.add_argument("--guidance-scale", type=float, default=4.0)
     parser.add_argument("--max-sequence-length", type=int, default=160, help="match the value precompute was run with")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     args = parser.parse_args()
+    if (args.height is None) != (args.width is None):
+        parser.error("--height and --width must be given together, or both omitted to auto-detect")
 
     source_image_path, mask_paths, segments = load_benchmark_case(args.benchmark_json, args.case_id)
     print(f"Case {args.case_id!r}: {len(segments)} instances")
@@ -171,11 +180,21 @@ def main() -> None:
     pipe.load_lora_weights(str(args.lora_dir))
 
     # --- image conditioning (source image to edit) ---
-    multiple_of = pipe.vae_scale_factor * 2
-    height = (args.height // multiple_of) * multiple_of
-    width = (args.width // multiple_of) * multiple_of
-
     source_image = Image.open(source_image_path).convert("RGB")
+    multiple_of = pipe.vae_scale_factor * 2
+    if args.height is not None:
+        height = (args.height // multiple_of) * multiple_of
+        width = (args.width // multiple_of) * multiple_of
+    else:
+        # Auto-pick a bucket matching the source image's own aspect ratio --
+        # the same generate_aspect_ratio_buckets/find_nearest_bucket system
+        # precompute_pe_lora_variants.py used to build the training cache, so
+        # inference isn't silently forcing a square crop the model was never
+        # trained to expect for this image's shape.
+        bucket_list = generate_aspect_ratio_buckets(args.resolution, divisibility=args.bucket_divisibility)
+        src_w, src_h = source_image.size
+        height, width = bucket_list[find_nearest_bucket(src_h, src_w, bucket_list)]
+        print(f"Auto-selected bucket {height}x{width} for source image {src_w}x{src_h} (pass --height/--width to override)")
     cond_image = pipe.image_processor.preprocess(source_image, height=height, width=width, resize_mode="crop")
     image_latents, image_latent_ids = pipe.prepare_image_latents(
         images=[cond_image], batch_size=1, generator=generator, device=device, dtype=pipe.vae.dtype
