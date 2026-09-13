@@ -123,6 +123,29 @@ def load_benchmark_case(benchmark_json: Path, case_id: str) -> tuple[Path, list[
     return data_root / case["image_path"], mask_paths, segments
 
 
+def resize_and_crop(image: Image.Image, target_w: int, target_h: int, resample: int) -> Image.Image:
+    """Resize (preserving aspect ratio, scaling up OR down as needed so the
+    image is at least target_w x target_h in both dimensions) then center-
+    crop to exactly that size -- mirrors precompute_pe_lora_variants.py's
+    augment_variant_multi (scale = max(target_h/h, target_w/w)) so the
+    source image and its masks undergo the identical geometric transform.
+
+    Needed because Flux2ImageProcessor's own resize_mode="crop"
+    (_resize_and_crop) skips the resize step entirely -- it crops directly
+    at the source's native pixel scale, assuming the caller already made it
+    >= the target size (true in the pipeline's own usage, where height/width
+    are always derived from the image's own size). Called with an
+    independently-sized bucket instead, a source image smaller than the
+    bucket in either dimension produces negative crop offsets, which
+    PIL.Image.crop silently fills with BLACK rather than erroring."""
+    img_w, img_h = image.size
+    scale = max(target_h / img_h, target_w / img_w)
+    resized = image.resize((round(img_w * scale), round(img_h * scale)), resample)
+    rw, rh = resized.size
+    left, top = (rw - target_w) // 2, (rh - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h))
+
+
 def build_prompt_and_spans(segments: list[str]) -> tuple[str, list[tuple[int, int]]]:
     """Joins instance clauses the same way precompute_pe_lora_variants.py's
     resolve_instance_segments does ("{seg0}{AND_GLUE}{seg1}...") so spans
@@ -195,7 +218,8 @@ def main() -> None:
         src_w, src_h = source_image.size
         height, width = bucket_list[find_nearest_bucket(src_h, src_w, bucket_list)]
         print(f"Auto-selected bucket {height}x{width} for source image {src_w}x{src_h} (pass --height/--width to override)")
-    cond_image = pipe.image_processor.preprocess(source_image, height=height, width=width, resize_mode="crop")
+    cond_image_cropped = resize_and_crop(source_image, width, height, Image.BILINEAR)
+    cond_image = pipe.image_processor.preprocess(cond_image_cropped, height=height, width=width)
     image_latents, image_latent_ids = pipe.prepare_image_latents(
         images=[cond_image], batch_size=1, generator=generator, device=device, dtype=pipe.vae.dtype
     )
@@ -216,7 +240,7 @@ def main() -> None:
     for mask_path in mask_paths:
         mask = exif_transpose(Image.open(mask_path)).convert("L")
         if mask.size != (width, height):
-            mask = mask.resize((width, height), Image.NEAREST)
+            mask = resize_and_crop(mask, width, height, Image.NEAREST)
         centroid_px = mask_centroid_px(np.array(mask))
         if centroid_px is None:
             raise ValueError(f"{mask_path}: mask has no dark (<128) pixels, can't derive a centroid")
